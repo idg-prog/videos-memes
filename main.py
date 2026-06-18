@@ -310,12 +310,27 @@ if st.session_state.shorts_path:
     # ── Detect faces ──────────────────────────────────────────────────────────
     cap_info = cv2.VideoCapture(st.session_state.shorts_path)
     total_frames_s3 = int(cap_info.get(cv2.CAP_PROP_FRAME_COUNT))
+    scan_fps = cap_info.get(cv2.CAP_PROP_FPS) or 30
     cap_info.release()
+    total_secs_s3 = total_frames_s3 / scan_fps
 
-    scan_frame_idx = st.slider("Scan frame for face detection",
-                               0, max(0, total_frames_s3 - 1),
-                               total_frames_s3 // 2, 1,
-                               help="Scrub to a frame where all faces are visible")
+    st.markdown("**Pick a time where all faces you want to tag are visible:**")
+    scan_sec = st.number_input(
+        "Jump to time (seconds)",
+        min_value=0.0, max_value=float(total_secs_s3),
+        value=0.0, step=0.5,
+        help=f"Video is {total_secs_s3:.1f}s long. Type the second where the face appears."
+    )
+    scan_frame_idx = int(scan_sec * scan_fps)
+
+    # Always show a live preview of the chosen frame
+    _prev_frame = grab_frame_at(st.session_state.shorts_path, scan_frame_idx)
+    if _prev_frame is not None:
+        _ph, _pw = _prev_frame.shape[:2]
+        _disp_w = min(_pw, 500)
+        _disp_h = int(_ph * _disp_w / _pw)
+        _prev_rgb = cv2.cvtColor(cv2.resize(_prev_frame, (_disp_w, _disp_h)), cv2.COLOR_BGR2RGB)
+        st.image(_prev_rgb, caption=f"Frame at {scan_sec:.1f}s  (frame {scan_frame_idx}/{total_frames_s3})")
 
     if st.button("🔍 Detect faces in this frame", use_container_width=True):
         mid = grab_frame_at(st.session_state.shorts_path, scan_frame_idx)
