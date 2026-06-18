@@ -344,8 +344,8 @@ if st.session_state.shorts_path:
     if st.session_state.face_snapshots:
         n_logos = len(logo_files) if logo_files else 0
         logo_options = ["— no logo —"] + [f"Logo {i+1}" for i in range(n_logos)]
-        auto_snaps = [s for s in st.session_state.face_snapshots if not s["manual"]]
-        manual_snaps = [s for s in st.session_state.face_snapshots if s["manual"]]
+        auto_snaps = [s for s in st.session_state.face_snapshots if not s.get("manual", False)]
+        manual_snaps = [s for s in st.session_state.face_snapshots if s.get("manual", False)]
 
         if auto_snaps:
             st.markdown(f"**{len(auto_snaps)} auto-detected face(s):**")
@@ -397,7 +397,7 @@ if st.session_state.shorts_path:
                 cv2.rectangle(pf,
                     (int(bx*pfw), int(by*pfh)),
                     (int((bx+bw2)*pfw), int((by+bh2)*pfh)),
-                    (0,255,0) if not s["manual"] else (255,165,0), 2)
+                    (0,255,0) if not s.get("manual", False) else (255,165,0), 2)
             # downscale for display
             disp_h = 400
             disp_w = int(pfw * disp_h / pfh)
@@ -461,7 +461,7 @@ if st.session_state.shorts_path:
                         dy = det_bbox[1] + det_bbox[3] / 2
                         # find closest auto snap
                         auto_snap_indices = [s["idx"] for s in st.session_state.face_snapshots
-                                             if not s["manual"]]
+                                             if not s.get("manual", False)]
                         if not auto_snap_indices:
                             continue
                         best = min(
