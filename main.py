@@ -6,254 +6,397 @@ from PIL import Image
 import tempfile
 import os
 
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Face Logo Tracker", layout="wide", page_icon="🎭")
 
-# ── Styling ──────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  .step-badge {
-    display: inline-block;
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+.step-wrap {
+    border: 1.5px solid #E5E7EB;
+    border-radius: 14px;
+    padding: 22px 26px 18px;
+    margin-bottom: 28px;
+    background: #FAFAFA;
+}
+.step-wrap.active { border-color: #6C63FF; background: #F5F4FF; }
+.step-wrap.done   { border-color: #22C55E; background: #F0FDF4; }
+
+.step-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 6px;
+}
+.step-num {
     background: #6C63FF;
     color: white;
     border-radius: 50%;
-    width: 32px; height: 32px;
-    line-height: 32px;
+    width: 30px; height: 30px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 15px; flex-shrink: 0;
+}
+.step-num.done-num { background: #22C55E; }
+.step-title { font-size: 18px; font-weight: 700; color: #111; }
+.step-sub   { font-size: 13px; color: #666; margin-top: 2px; margin-left: 42px; }
+
+.face-card {
+    border: 1.5px solid #E5E7EB;
+    border-radius: 10px;
+    padding: 12px;
     text-align: center;
-    font-weight: 700;
-    font-size: 16px;
-    margin-right: 10px;
-  }
-  .step-title {
-    font-size: 22px;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    margin-bottom: 4px;
-  }
-  .step-box {
-    border: 1.5px solid #e0e0e0;
-    border-radius: 12px;
-    padding: 24px;
-    margin-bottom: 28px;
-    background: #fafafa;
-  }
-  .done-badge {
-    background: #22c55e;
-    color: white;
-    border-radius: 8px;
-    padding: 2px 10px;
-    font-size: 13px;
-    margin-left: 10px;
-  }
+    background: white;
+}
+.face-card img { border-radius: 6px; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎭 Face Logo Tracker")
-st.caption("Crop your video into a short clip, then overlay motion-tracked logos on every face.")
+st.markdown("## 🎭 Face Logo Tracker")
+st.caption("Three steps: crop → reformat for Shorts → assign logos to each face.")
+
+# ── Session state ─────────────────────────────────────────────────────────────
+for key, default in [
+    ("src_path", None),
+    ("cropped_path", None),
+    ("shorts_path", None),
+    ("face_snapshots", []),   # list of (face_index, jpeg_bytes, bbox_norm)
+    ("fps", 30.0),
+    ("src_w", 0),
+    ("src_h", 0),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 mp_face_detection = mp.solutions.face_detection
 
-# ── Session state ─────────────────────────────────────────────────────────────
-if "cropped_path" not in st.session_state:
-    st.session_state.cropped_path = None
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def overlay_logo_on_frame(frame, logo_bgra, bbox):
+    fh, fw = frame.shape[:2]
+    xmin, ymin, bw, bh = bbox
+    x = int(xmin * fw);  y = int(ymin * fh)
+    w = int(bw * fw);    h = int(bh * fh)
+    if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > fw or y + h > fh:
+        return frame
+    resized = cv2.resize(logo_bgra, (w, h), interpolation=cv2.INTER_AREA)
+    if resized.shape[2] == 4:
+        alpha  = resized[:, :, 3:4] / 255.0
+        logo_b = resized[:, :, :3].astype(float)
+        roi    = frame[y:y+h, x:x+w].astype(float)
+        frame[y:y+h, x:x+w] = (logo_b * alpha + roi * (1 - alpha)).astype(np.uint8)
+    else:
+        frame[y:y+h, x:x+w] = resized[:, :, :3]
+    return frame
+
+
+def reformat_to_shorts(frame, target_w=1080, target_h=1920):
+    """Letterbox / crop a landscape frame into 9:16 (1080×1920)."""
+    h, w = frame.shape[:2]
+    # scale so height fills target_h
+    scale = target_h / h
+    new_w = int(w * scale)
+    resized = cv2.resize(frame, (new_w, target_h))
+    # centre-crop width
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    if new_w >= target_w:
+        x_off = (new_w - target_w) // 2
+        canvas = resized[:, x_off:x_off + target_w]
+    else:
+        x_off = (target_w - new_w) // 2
+        canvas[:, x_off:x_off + new_w] = resized
+    return canvas
+
+
+def detect_faces_in_frame(frame, detector):
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = detector.process(rgb)
+    faces = []
+    if results.detections:
+        for det in results.detections:
+            bb = det.location_data.relative_bounding_box
+            faces.append((bb.xmin, bb.ymin, bb.width, bb.height))
+    return faces
+
+
+def grab_midframe(path):
+    cap = cv2.VideoCapture(path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, total // 2)
+    ret, frame = cap.read()
+    cap.release()
+    return frame if ret else None
+
+
+def frame_to_jpeg_bytes(frame_rgb):
+    pil = Image.fromarray(frame_rgb)
+    import io
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG")
+    return buf.getvalue()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — Crop Video
+# STEP 1 — Upload & Crop
 # ══════════════════════════════════════════════════════════════════════════════
-st.markdown("""
-<div class="step-box">
-  <div class="step-title">
-    <span class="step-badge">1</span> Crop Your Video
+step1_done = st.session_state.cropped_path is not None
+s1_class = "done" if step1_done else "active"
+st.markdown(f"""
+<div class="step-wrap {s1_class}">
+  <div class="step-header">
+    <div class="step-num {'done-num' if step1_done else ''}">{'✓' if step1_done else '1'}</div>
+    <div class="step-title">Upload & Crop</div>
   </div>
-  <p style="color:#666;margin-top:4px;">Upload a video and trim it to a short clip before processing.</p>
+  <div class="step-sub">Trim your video to the clip you want to use.</div>
 </div>
 """, unsafe_allow_html=True)
 
-video_file = st.file_uploader("Upload video", type=["mp4", "mov", "avi"], key="video_upload")
+video_file = st.file_uploader("Upload video", type=["mp4", "mov", "avi"], key="vu")
 
 if video_file:
-    # Save upload to temp file
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tfile.write(video_file.read())
-    tfile.flush()
-    src_path = tfile.name
+    if st.session_state.src_path is None:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(video_file.read())
+        tfile.flush()
+        st.session_state.src_path = tfile.name
+        cap_i = cv2.VideoCapture(tfile.name)
+        st.session_state.fps   = cap_i.get(cv2.CAP_PROP_FPS) or 30
+        st.session_state.src_w = int(cap_i.get(cv2.CAP_PROP_FRAME_WIDTH))
+        st.session_state.src_h = int(cap_i.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_f = int(cap_i.get(cv2.CAP_PROP_FRAME_COUNT))
+        st.session_state.src_duration = total_f / st.session_state.fps
+        cap_i.release()
 
-    cap_info = cv2.VideoCapture(src_path)
-    fps = cap_info.get(cv2.CAP_PROP_FPS) or 30
-    total_frames = int(cap_info.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps
-    cap_info.release()
+    duration = st.session_state.src_duration
+    st.video(st.session_state.src_path)
+    st.caption(f"Duration: **{duration:.1f}s** · {st.session_state.src_w}×{st.session_state.src_h} · {st.session_state.fps:.0f} fps")
 
-    st.video(src_path)
-    st.caption(f"Duration: **{duration:.1f}s** · FPS: **{fps:.0f}** · Frames: **{total_frames}**")
+    c1, c2 = st.columns(2)
+    with c1:
+        start_s = st.number_input("Start (seconds)", 0.0, max(0.0, duration - 0.5), 0.0, 0.5)
+    with c2:
+        end_s   = st.number_input("End (seconds)",   0.5, duration, min(60.0, duration), 0.5)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        start_sec = st.number_input("Start time (seconds)", min_value=0.0,
-                                    max_value=max(0.0, duration - 0.5),
-                                    value=0.0, step=0.5)
-    with col2:
-        end_sec = st.number_input("End time (seconds)", min_value=0.5,
-                                  max_value=duration,
-                                  value=min(30.0, duration), step=0.5)
-
-    if st.button("✂️ Crop Video", use_container_width=True):
-        if end_sec <= start_sec:
+    if st.button("✂️ Crop clip", use_container_width=True):
+        if end_s <= start_s:
             st.error("End time must be after start time.")
         else:
-            start_frame = int(start_sec * fps)
-            end_frame = int(end_sec * fps)
-
-            cap = cv2.VideoCapture(src_path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-            out_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            out_path = out_file.name
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-
-            progress = st.progress(0, text="Cropping…")
-            total = end_frame - start_frame
+            fps = st.session_state.fps
+            sf  = int(start_s * fps)
+            ef  = int(end_s   * fps)
+            cap = cv2.VideoCapture(st.session_state.src_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+            w = st.session_state.src_w;  h = st.session_state.src_h
+            out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            writer = cv2.VideoWriter(out.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            prog = st.progress(0, text="Cropping…")
+            total = ef - sf
             for i in range(total):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                writer.write(frame)
-                progress.progress((i + 1) / total, text=f"Cropping… {i+1}/{total} frames")
-
-            cap.release()
-            writer.release()
-            progress.empty()
-
-            st.session_state.cropped_path = out_path
-            st.success(f"✅ Cropped! Clip is {end_sec - start_sec:.1f}s long.")
+                ret, frm = cap.read()
+                if not ret: break
+                writer.write(frm)
+                prog.progress((i+1)/total, text=f"Cropping… {i+1}/{total}")
+            cap.release(); writer.release(); prog.empty()
+            st.session_state.cropped_path = out.name
+            # reset downstream
+            st.session_state.shorts_path    = None
+            st.session_state.face_snapshots = []
+            st.success(f"✅ Cropped to {end_s - start_s:.1f}s")
+            st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Add Logos
+# STEP 2 — Reformat to Shorts (9:16)
 # ══════════════════════════════════════════════════════════════════════════════
-step2_done = st.session_state.cropped_path is not None
-badge_suffix = '<span class="done-badge">✓ Ready</span>' if step2_done else ""
+step2_done = st.session_state.shorts_path is not None
+if st.session_state.cropped_path:
+    s2_class = "done" if step2_done else "active"
+    st.markdown(f"""
+    <div class="step-wrap {s2_class}">
+      <div class="step-header">
+        <div class="step-num {'done-num' if step2_done else ''}">{'✓' if step2_done else '2'}</div>
+        <div class="step-title">Reformat for TikTok / YouTube Shorts</div>
+      </div>
+      <div class="step-sub">Converts your clip to 1080×1920 vertical (9:16). Wide videos are centre-cropped; tall videos are padded.</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-st.markdown(f"""
-<div class="step-box">
-  <div class="step-title">
-    <span class="step-badge">2</span> Overlay Logos on Faces {badge_suffix}
-  </div>
-  <p style="color:#666;margin-top:4px;">Upload up to 5 logos. Each detected face gets the next logo in your list (cycles if there are more faces than logos).</p>
-</div>
-""", unsafe_allow_html=True)
+    tw = st.number_input("Output width",  value=1080, step=2)
+    th = st.number_input("Output height", value=1920, step=2)
 
-if not step2_done:
-    st.info("Complete Step 1 first to unlock this step.")
-else:
+    if st.button("📱 Reformat to Shorts", use_container_width=True):
+        fps = st.session_state.fps
+        cap = cv2.VideoCapture(st.session_state.cropped_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        out  = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        writer = cv2.VideoWriter(out.name, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 fps, (int(tw), int(th)))
+        prog = st.progress(0, text="Reformatting…")
+        for i in range(total):
+            ret, frm = cap.read()
+            if not ret: break
+            writer.write(reformat_to_shorts(frm, int(tw), int(th)))
+            prog.progress((i+1)/total, text=f"Reformatting… {i+1}/{total}")
+        cap.release(); writer.release(); prog.empty()
+        st.session_state.shorts_path    = out.name
+        st.session_state.face_snapshots = []   # reset downstream
+        st.success("✅ Reformatted to vertical!")
+        st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Assign logos to faces & render
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.shorts_path:
+    st.markdown("""
+    <div class="step-wrap active">
+      <div class="step-header">
+        <div class="step-num">3</div>
+        <div class="step-title">Assign Logos to Faces</div>
+      </div>
+      <div class="step-sub">We scan the mid-frame of your clip, show each detected face, and let you pick which logo goes on each one.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Logo upload ───────────────────────────────────────────────────────────
     logo_files = st.file_uploader(
-        "Upload logos (PNG with transparency recommended) — up to 5",
-        type=["png", "jpg", "jpeg"],
+        "Upload logos (up to 5 — PNG with transparency recommended)",
+        type=["png","jpg","jpeg"],
         accept_multiple_files=True,
-        key="logo_upload"
+        key="logos"
     )
+    if logo_files and len(logo_files) > 5:
+        st.warning("Only first 5 logos used.")
+        logo_files = logo_files[:5]
 
     if logo_files:
-        if len(logo_files) > 5:
-            st.warning("Only the first 5 logos will be used.")
-            logo_files = logo_files[:5]
-
-        # Preview logos
-        cols = st.columns(len(logo_files))
+        st.markdown("**Your logos:**")
+        lcols = st.columns(len(logo_files))
         for i, lf in enumerate(logo_files):
-            with cols[i]:
-                st.image(lf, caption=f"Logo {i+1}", width=80)
+            with lcols[i]:
+                st.image(lf, caption=f"Logo {i+1}", width=70)
 
-    confidence = st.slider("Face detection confidence", 0.0, 1.0, 0.5, 0.05)
+    # ── Face detection on mid-frame ───────────────────────────────────────────
+    if st.button("🔍 Detect faces in clip", use_container_width=True):
+        mid = grab_midframe(st.session_state.shorts_path)
+        if mid is None:
+            st.error("Could not read a frame from the video.")
+        else:
+            with mp_face_detection.FaceDetection(model_selection=1,
+                                                  min_detection_confidence=0.4) as det:
+                faces = detect_faces_in_frame(mid, det)
 
-    if logo_files and st.button("🚀 Process Video", use_container_width=True, type="primary"):
+            snapshots = []
+            fh, fw = mid.shape[:2]
+            for idx, (xmin, ymin, bw, bh) in enumerate(faces):
+                x = max(0, int(xmin * fw));  y = max(0, int(ymin * fh))
+                w = min(int(bw * fw), fw - x);  h = min(int(bh * fh), fh - y)
+                crop_bgr  = mid[y:y+h, x:x+w]
+                crop_rgb  = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                jbytes    = frame_to_jpeg_bytes(crop_rgb)
+                snapshots.append({"idx": idx, "jpeg": jbytes,
+                                   "bbox": (xmin, ymin, bw, bh)})
+            st.session_state.face_snapshots = snapshots
+            if not snapshots:
+                st.warning("No faces found in the mid-frame. Try adjusting your clip or detection confidence.")
+            st.rerun()
 
-        # Prepare logos as numpy arrays
-        logos_cv = []
-        for lf in logo_files:
-            pil_img = Image.open(lf).convert("RGBA")
-            arr = np.array(pil_img)
-            # RGBA → BGRA
-            bgra = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
-            logos_cv.append(bgra)
+    # ── Per-face logo assignment UI ───────────────────────────────────────────
+    face_logo_map = {}   # face_idx → logo_index (0-based) or None
 
-        def overlay_logo(frame, logo, bbox):
-            fh, fw = frame.shape[:2]
-            xmin, ymin, width, height = bbox
-            x = int(xmin * fw)
-            y = int(ymin * fh)
-            w = int(width * fw)
-            h = int(height * fh)
-            if x < 0 or y < 0 or x + w > fw or y + h > fh or w <= 0 or h <= 0:
-                return frame
-            resized = cv2.resize(logo, (w, h), interpolation=cv2.INTER_AREA)
-            if resized.shape[2] == 4:
-                alpha = resized[:, :, 3:4] / 255.0
-                logo_rgb = resized[:, :, :3]
-                roi = frame[y:y+h, x:x+w].astype(float)
-                blended = logo_rgb * alpha + roi * (1 - alpha)
-                frame[y:y+h, x:x+w] = blended.astype(np.uint8)
-            else:
-                frame[y:y+h, x:x+w] = resized[:, :, :3]
-            return frame
+    if st.session_state.face_snapshots:
+        n_faces = len(st.session_state.face_snapshots)
+        n_logos = len(logo_files) if logo_files else 0
+        logo_options = (["— no logo —"] +
+                        [f"Logo {i+1}" for i in range(n_logos)])
 
-        cap = cv2.VideoCapture(st.session_state.cropped_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        st.markdown(f"**{n_faces} face(s) detected.** Assign a logo to each:")
 
-        out_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        out_path = out_file.name
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+        cols = st.columns(min(n_faces, 4))
+        for snap in st.session_state.face_snapshots:
+            fi = snap["idx"]
+            col = cols[fi % len(cols)]
+            with col:
+                st.markdown('<div class="face-card">', unsafe_allow_html=True)
+                st.image(snap["jpeg"], caption=f"Face {fi+1}", use_container_width=True)
+                choice = st.selectbox(
+                    f"Logo for face {fi+1}",
+                    options=logo_options,
+                    key=f"logo_choice_{fi}"
+                )
+                if choice != "— no logo —":
+                    logo_idx = int(choice.split()[-1]) - 1
+                    face_logo_map[fi] = logo_idx
+                st.markdown('</div>', unsafe_allow_html=True)
 
-        progress = st.progress(0, text="Processing frames…")
-        preview = st.empty()
+    # ── Confidence slider & render button ─────────────────────────────────────
+    confidence = st.slider("Face detection confidence (processing)", 0.0, 1.0, 0.45, 0.05)
 
-        with mp_face_detection.FaceDetection(model_selection=1,
-                                              min_detection_confidence=confidence) as detector:
-            frame_idx = 0
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
+    if (st.session_state.face_snapshots and logo_files and
+            st.button("🚀 Render final video", use_container_width=True, type="primary")):
 
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = detector.process(rgb)
+        if not face_logo_map:
+            st.warning("Assign at least one logo to a face before rendering.")
+        else:
+            # Prepare logo arrays
+            logos_bgra = []
+            for lf in logo_files:
+                pil = Image.open(lf).convert("RGBA")
+                arr = np.array(pil)
+                logos_bgra.append(cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA))
 
-                if results.detections:
-                    for face_i, detection in enumerate(results.detections):
-                        logo = logos_cv[face_i % len(logos_cv)]
-                        bb = detection.location_data.relative_bounding_box
-                        frame = overlay_logo(frame, logo,
-                                             (bb.xmin, bb.ymin, bb.width, bb.height))
+            cap   = cv2.VideoCapture(st.session_state.shorts_path)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps   = cap.get(cv2.CAP_PROP_FPS) or 30
+            fw    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            fh    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-                writer.write(frame)
+            out   = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            writer = cv2.VideoWriter(out.name, cv2.VideoWriter_fourcc(*"mp4v"),
+                                     fps, (fw, fh))
 
-                frame_idx += 1
-                progress.progress(frame_idx / total_frames,
-                                   text=f"Processing… {frame_idx}/{total_frames} frames")
+            prog    = st.progress(0, text="Rendering…")
+            preview = st.empty()
 
-                # Preview every 15 frames
-                if frame_idx % 15 == 0:
-                    preview.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                  channels="RGB", use_container_width=True)
+            with mp_face_detection.FaceDetection(model_selection=1,
+                                                  min_detection_confidence=confidence) as det:
+                for fi in range(total):
+                    ret, frame = cap.read()
+                    if not ret: break
 
-        cap.release()
-        writer.release()
-        progress.empty()
-        preview.empty()
+                    faces = detect_faces_in_frame(frame, det)
 
-        st.success("✅ Done! Download your video below.")
-        with open(out_path, "rb") as f:
-            st.download_button(
-                label="⬇️ Download Processed Video",
-                data=f,
-                file_name="face_logo_overlay.mp4",
-                mime="video/mp4",
-                use_container_width=True
-            )
+                    # Match detected faces to assignment by proximity to snapshot bbox
+                    snap_bboxes = [s["bbox"] for s in st.session_state.face_snapshots]
+
+                    for det_bbox in faces:
+                        # find closest snapshot face by bbox centre distance
+                        dx = det_bbox[0] + det_bbox[2]/2
+                        dy = det_bbox[1] + det_bbox[3]/2
+                        best_snap = min(
+                            range(len(snap_bboxes)),
+                            key=lambda i: abs(snap_bboxes[i][0]+snap_bboxes[i][2]/2 - dx)
+                                        + abs(snap_bboxes[i][1]+snap_bboxes[i][3]/2 - dy)
+                        )
+                        if best_snap in face_logo_map:
+                            logo_idx = face_logo_map[best_snap]
+                            frame = overlay_logo_on_frame(frame, logos_bgra[logo_idx], det_bbox)
+
+                    writer.write(frame)
+                    prog.progress((fi+1)/total, text=f"Rendering… {fi+1}/{total}")
+                    if fi % 20 == 0:
+                        preview.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                      channels="RGB", use_container_width=True)
+
+            cap.release(); writer.release()
+            prog.empty(); preview.empty()
+
+            st.success("✅ Done! Your video is ready.")
+            with open(out.name, "rb") as f:
+                st.download_button(
+                    "⬇️ Download final video",
+                    data=f,
+                    file_name="shorts_face_logos.mp4",
+                    mime="video/mp4",
+                    use_container_width=True
+                )
