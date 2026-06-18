@@ -1,3 +1,4 @@
 libgl1
 libglx-mesa0
 libegl1
+ffmpeg
